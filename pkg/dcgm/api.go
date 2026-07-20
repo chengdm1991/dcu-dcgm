@@ -87,20 +87,21 @@ func Init() (err error) {
 
 					glog.V(5).Infof("retryCount:%v", retryCount)
 					if retryCount >= maxRetries {
-						glog.V(5).Infof("设备数量连续 %d 次相同但与 devCount 不相等，初始化失败", maxRetries)
-						// 返回最相关的错误，优先返回初始化错误
-						errMsg := "设备数量不一致"
+						glog.Warningf(
+							"设备数量连续 %d 次相同但仍不一致 (devCount=%d, numDevices=%d, deviceCount=%d)，继续启动",
+							maxRetries, devCount, numDevices, deviceCount,
+						)
 						if numErr != nil {
-							errMsg = fmt.Sprintf("%s: %v", errMsg, numErr)
+							glog.Warningf("NumMonitorDevices 错误: %v", numErr)
 						}
 						if countErr != nil {
-							errMsg = fmt.Sprintf("%s: %v", errMsg, countErr)
+							glog.Warningf("DeviceCount 错误: %v", countErr)
 						}
-						// 如果有 listErr，也包含它
 						if listErr != nil {
-							errMsg = fmt.Sprintf("%s; 同时出现: %v", errMsg, listErr)
+							glog.Warningf("listFilesInDevDri 错误: %v", listErr)
 						}
-						return fmt.Errorf(errMsg)
+						probeDriverCaps()
+						return listErr
 					}
 					lastNumDevices = numDevices // 更新记录的设备数量
 					ShutDown()                  // 数量不相等，执行关闭操作
@@ -476,7 +477,7 @@ func CollectDeviceMetrics() (monitorInfos []MonitorInfo, err error) {
 			go func() {
 				defer wgDevice.Done()
 				sent, received, maxPktSz, _ := rsmiDevPciThroughputGet(deviceIndex)
-				pcieBwMb, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", float64(received+sent)*float64(maxPktSz)/1024.0/1024.0), 64)
+				_, _, pcieBwMb := pcieThroughputMB(sent, received, maxPktSz)
 				muDevice.Lock()
 				monitorInfo.PcieBwMb = pcieBwMb
 				muDevice.Unlock()
@@ -629,9 +630,7 @@ func GetDeviceByDvInd(dvInd int) (physicalDeviceInfo PhysicalDeviceInfo, err err
 	ur, _ := strconv.ParseFloat(fmt.Sprintf("%.2f", float64(utilizationRate)/1.0), 64)
 	//获取pcie流量信息
 	sent, received, maxPktSz, _ := rsmiDevPciThroughputGet(dvInd)
-	pcieSent, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", float64(sent)/1024.0/1024.0), 64)
-	pcieReceived, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", float64(received)/1024.0/1024.0), 64)
-	pcieBwMb, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", float64(received+sent)*float64(maxPktSz)/1024.0/1024.0), 64)
+	pcieSent, pcieReceived, pcieBwMb := pcieThroughputMB(sent, received, maxPktSz)
 	//获取设备系统时钟速度列表
 	clk, _ := rsmiDevGpuClkFreqGet(dvInd, RSMI_CLK_TYPE_SYS)
 	sclk, _ := strconv.ParseFloat(fmt.Sprintf("%.2f", float64(clk.Frequency[clk.Current])/1000000.0), 64)
@@ -796,9 +795,7 @@ func AllDeviceInfos() ([]PhysicalDeviceInfo, error) {
 		//glog.V(5).Infof(" DCU[%v] utilization rate : %.0f", i, ur)
 		//获取pcie流量信息
 		sent, received, maxPktSz, _ := rsmiDevPciThroughputGet(i)
-		pcieSent, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", float64(sent)/1024.0/1024.0), 64)
-		pcieReceived, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", float64(received)/1024.0/1024.0), 64)
-		pcieBwMb, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", float64(received+sent)*float64(maxPktSz)/1024.0/1024.0), 64)
+		pcieSent, pcieReceived, pcieBwMb := pcieThroughputMB(sent, received, maxPktSz)
 		//glog.V(5).Infof(" DCU[%v] PCIE  bandwidth : %.0f", i, pcieBwMb)
 		//获取设备系统时钟速度列表
 		clk, _ := rsmiDevGpuClkFreqGet(i, RSMI_CLK_TYPE_SYS)
@@ -1182,9 +1179,7 @@ func DeviceStatus() (deviceStatusInfos []DeviceStatusInfo, err error) {
 		ur, _ := strconv.ParseFloat(fmt.Sprintf("%.2f", float64(utilizationRate)/1.0), 64)
 		//获取pcie流量信息
 		sent, received, maxPktSz, _ := rsmiDevPciThroughputGet(i)
-		pcieSent, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", float64(sent)/1024.0/1024.0), 64)
-		pcieReceived, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", float64(received)/1024.0/1024.0), 64)
-		pcieBwMb, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", float64(received+sent)*float64(maxPktSz)/1024.0/1024.0), 64)
+		pcieSent, pcieReceived, pcieBwMb := pcieThroughputMB(sent, received, maxPktSz)
 		clk, err := rsmiDevGpuClkFreqGet(i, RSMI_CLK_TYPE_SYS)
 		var sclk = 0.0
 		if err == nil {
@@ -2536,13 +2531,10 @@ func ShowPcieBw(dvIdList []int) (pcieBandwidthInfos []PcieBandwidthInfo, err err
 	for _, device := range dvIdList {
 		sent, received, maxPktSz, err := rsmiDevPciThroughputGet(device)
 		if err == nil {
-			// 计算带宽
-			sent, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", float64(sent)/1024.0/1024.0), 64)
-			received, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", float64(received)/1024.0/1024.0), 64)
-			bw, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", float64(received+sent)*float64(maxPktSz)/1024.0/1024.0), 64)
+			sentMB, receivedMB, bw := pcieThroughputMB(sent, received, maxPktSz)
 			bwstr := fmt.Sprintf("%.3f", bw)
 			glog.V(5).Infof("device:%v Estimated maximum PCIe bandwidth over the last second (MB/s):%v", device, bwstr)
-			pcieBandwidthInfos = append(pcieBandwidthInfos, PcieBandwidthInfo{DvInd: device, Sent: sent, Received: received, Bw: bw})
+			pcieBandwidthInfos = append(pcieBandwidthInfos, PcieBandwidthInfo{DvInd: device, Sent: sentMB, Received: receivedMB, Bw: bw})
 		} else {
 			glog.Warning("GPU PCIe bandwidth usage not supported")
 			pcieBandwidthInfos = append(pcieBandwidthInfos, PcieBandwidthInfo{DvInd: device, Sent: 0, Received: 0, Bw: 0})
@@ -2555,14 +2547,27 @@ func ShowPcieBw(dvIdList []int) (pcieBandwidthInfos []PcieBandwidthInfo, err err
 func PcieBw(dvInd int) (pcieBandwidthInfo PcieBandwidthInfo, err error) {
 	sent, received, maxPktSz, err := rsmiDevPciThroughputGet(dvInd)
 	if err == nil {
-
-		sent, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", float64(sent)/1024.0/1024.0), 64)
-		received, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", float64(received)/1024.0/1024.0), 64)
-		bw, _ := strconv.ParseFloat(fmt.Sprintf("%.3f", float64(received+sent)*float64(maxPktSz)/1024.0/1024.0), 64)
+		sentMB, receivedMB, bw := pcieThroughputMB(sent, received, maxPktSz)
 		pcieBandwidthInfo = PcieBandwidthInfo{
 			DvInd:    dvInd,
-			Sent:     sent,
-			Received: received,
+			Sent:     sentMB,
+			Received: receivedMB,
+			Bw:       bw,
+		}
+		glog.V(5).Infof("device:%v Estimated maximum PCIe bandwidth over the last second (MB/s):%v", pcieBandwidthInfo, bw)
+	}
+	glog.V(5).Infof("pcieBandwidthInfo:%v", (pcieBandwidthInfo))
+	return
+}
+
+func PcieBwTest(dvInd int) (pcieBandwidthInfo PcieBandwidthInfo, err error) {
+	sent, received, maxPktSz, err := rsmiDevPciThroughputGet(dvInd)
+	if err == nil {
+		sentMB, receivedMB, bw := pcieThroughputMB(sent, received, maxPktSz)
+		pcieBandwidthInfo = PcieBandwidthInfo{
+			DvInd:    dvInd,
+			Sent:     sentMB,
+			Received: receivedMB,
 			Bw:       bw,
 		}
 		glog.V(5).Infof("device:%v Estimated maximum PCIe bandwidth over the last second (MB/s):%v", pcieBandwidthInfo, bw)
@@ -4333,7 +4338,7 @@ func BandwidthTest(dvIdList []int) bool {
 		}
 	}
 	if allZero {
-		glog.Errorf("带宽测试结果为空或全部为0")
+		glog.Errorf("带宽测试结果为空或全部为0，devices=%v，详见 %s/hbm_bandwidth_oam*.log", dvIdList, DiagLogDirBandwidth)
 		return false
 	}
 	return true
@@ -4370,7 +4375,7 @@ func BandwidthTestResult(dvIdList []int) (map[int]float64, error) {
 	}
 
 	if allZero {
-		err = fmt.Errorf("带宽测试结果为空或全部为0")
+		err = fmt.Errorf("带宽测试结果为空或全部为0，devices=%v，详见 %s/hbm_bandwidth_oam*.log", dvIdList, DiagLogDirBandwidth)
 		glog.Error(err)
 		return bwMap, err
 	}
